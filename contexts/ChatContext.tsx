@@ -1,0 +1,206 @@
+'use client'
+import { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react'
+import { io, Socket } from 'socket.io-client'
+import { chatApi, RoomOut, MessageOut } from '@/lib/api'
+import { useAuth } from './AuthContext'
+
+export type { RoomOut as Room, MessageOut as Message }
+export type RoomKind = RoomOut['kind']
+
+interface ChatCtx {
+  rooms: RoomOut[]
+  activeId: number | null
+  setActiveId: (id: number) => void
+  messages: MessageOut[]
+  loadingMessages: boolean
+  sendMessage: (roomId: number, content: string) => Promise<void>
+  createRoom: (data: {
+    kind: string; name: string; emoji?: string; description?: string
+    is_teacher_only?: boolean; member_ids?: number[]
+  }) => Promise<RoomOut>
+  deleteRoom: (id: number) => Promise<void>
+  react: (messageId: number, emoji: string) => Promise<void>
+  refreshRooms: () => Promise<void>
+  emitTyping: (roomId: number, isTyping: boolean) => void
+  typingUsers: Record<number, Record<number, string>>  // roomId → { userId: userName }
+  getDmId: (aId: string, bId: string) => string
+}
+
+const ChatContext = createContext<ChatCtx>({
+  rooms: [], activeId: null, messages: [], loadingMessages: false,
+  typingUsers: {},
+  setActiveId: () => {}, sendMessage: async () => {},
+  createRoom: async () => ({} as RoomOut), deleteRoom: async () => {},
+  react: async () => {}, refreshRooms: async () => {},
+  emitTyping: () => {},
+  getDmId: () => '',
+})
+
+const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+export function ChatProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth()
+  const [rooms, setRooms] = useState<RoomOut[]>([])
+  const [activeId, setActiveIdState] = useState<number | null>(null)
+  const [messages, setMessages] = useState<MessageOut[]>([])
+  const [loadingMessages, setLoadingMessages] = useState(false)
+  const [typingUsers, setTypingUsers] = useState<Record<number, Record<number, string>>>({})
+  const socketRef = useRef<Socket | null>(null)
+  const activeIdRef = useRef<number | null>(null)
+
+  // Socket.io 연결
+  useEffect(() => {
+    if (!user) return
+    const token = localStorage.getItem('harang_token')
+    if (!token) return
+
+    const socket = io(BASE, { auth: { token }, transports: ['websocket'] })
+    socketRef.current = socket
+
+    socket.on('connect', () => {
+      console.log('🔌 Socket connected')
+      // 현재 활성 방에 재입장
+      if (activeIdRef.current) socket.emit('room:join', activeIdRef.current)
+    })
+
+    // 실시간 메시지 수신
+    socket.on('message:receive', (msg: MessageOut) => {
+      // 현재 보고 있는 방의 메시지면 추가
+      if (msg.room_id === activeIdRef.current) {
+        setMessages(prev => {
+          // 중복 방지
+          if (prev.find(m => m.id === msg.id)) return prev
+          return [...prev, msg]
+        })
+      }
+      // 방 목록의 last_message 업데이트
+      setRooms(prev => prev.map(r =>
+        r.id === msg.room_id
+          ? {
+              ...r,
+              last_message: msg.content.slice(0, 40),
+              last_time: new Date(msg.created_at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false }),
+              unread: r.id === activeIdRef.current ? 0 : r.unread + 1,
+            }
+          : r
+      ))
+    })
+
+    // 타이핑 표시 — userId로 트래킹해야 stop이 정확히 매치됨
+    socket.on('typing:user', ({ userId, userName, roomId }: { userId: number; userName: string; roomId: number }) => {
+      setTypingUsers(prev => ({
+        ...prev,
+        [roomId]: { ...(prev[roomId] || {}), [userId]: userName },
+      }))
+    })
+    socket.on('typing:stop', ({ userId, roomId }: { userId: number; roomId: number }) => {
+      setTypingUsers(prev => {
+        const room = { ...(prev[roomId] || {}) }
+        delete room[userId]
+        return { ...prev, [roomId]: room }
+      })
+    })
+
+    socket.on('disconnect', () => console.log('🔌 Socket disconnected'))
+
+    return () => { socket.disconnect(); socketRef.current = null }
+  }, [user])
+
+  // 방 목록 로드
+  const refreshRooms = useCallback(async () => {
+    if (!user) return
+    try {
+      const data = await chatApi.getRooms()
+      setRooms(data)
+      if (!activeIdRef.current && data.length > 0) {
+        const firstId = data[0].id
+        setActiveIdState(firstId)
+        activeIdRef.current = firstId
+        socketRef.current?.emit('room:join', firstId)
+      }
+    } catch { /* backend not available */ }
+  }, [user])
+
+  useEffect(() => { refreshRooms() }, [user])
+
+  // 메시지 로드
+  const loadMessages = useCallback(async (roomId: number) => {
+    setLoadingMessages(true)
+    try {
+      const data = await chatApi.getMessages(roomId)
+      setMessages(data)
+    } catch { setMessages([]) }
+    finally { setLoadingMessages(false) }
+  }, [])
+
+  const setActiveId = useCallback((id: number) => {
+    // 이전 방 퇴장
+    if (activeIdRef.current && activeIdRef.current !== id) {
+      socketRef.current?.emit('room:leave', activeIdRef.current)
+    }
+    setActiveIdState(id)
+    activeIdRef.current = id
+    // 새 방 입장
+    socketRef.current?.emit('room:join', id)
+    loadMessages(id)
+    setRooms(prev => prev.map(r => r.id === id ? { ...r, unread: 0 } : r))
+  }, [loadMessages])
+
+  // Socket.io로 메시지 전송 (REST fallback)
+  const sendMessage = useCallback(async (roomId: number, content: string) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('message:send', { roomId, content })
+    } else {
+      // fallback: REST API
+      const msg = await chatApi.sendMessage(roomId, content)
+      setMessages(prev => [...prev, msg])
+      setRooms(prev => prev.map(r =>
+        r.id === roomId
+          ? { ...r, last_message: content.slice(0, 40), last_time: new Date(msg.created_at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false }) }
+          : r
+      ))
+    }
+  }, [])
+
+  const createRoom = useCallback(async (data: Parameters<ChatCtx['createRoom']>[0]) => {
+    const room = await chatApi.createRoom(data)
+    setRooms(prev => prev.find(r => r.id === room.id) ? prev : [...prev, room])
+    setActiveId(room.id)
+    return room
+  }, [setActiveId])
+
+  const deleteRoom = useCallback(async (id: number) => {
+    await chatApi.deleteRoom(id)
+    setRooms(prev => prev.filter(r => r.id !== id))
+    if (activeIdRef.current === id) {
+      const remaining = rooms.filter(r => r.id !== id)
+      if (remaining.length > 0) setActiveId(remaining[0].id)
+      else { setActiveIdState(null); activeIdRef.current = null; setMessages([]) }
+    }
+  }, [rooms, setActiveId])
+
+  const react = useCallback(async (messageId: number, emoji: string) => {
+    await chatApi.react(messageId, emoji)
+    if (activeIdRef.current) await loadMessages(activeIdRef.current)
+  }, [loadMessages])
+
+  // 타이핑 상태 emit (debounce는 호출자 측에서 관리)
+  const emitTyping = useCallback((roomId: number, isTyping: boolean) => {
+    if (!socketRef.current?.connected) return
+    socketRef.current.emit(isTyping ? 'typing:start' : 'typing:stop', roomId)
+  }, [])
+
+  const getDmId = (aId: string, bId: string) => `dm_${[aId, bId].sort().join('_')}`
+
+  return (
+    <ChatContext.Provider value={{
+      rooms, activeId, messages, loadingMessages, typingUsers,
+      setActiveId, sendMessage, createRoom, deleteRoom, react,
+      refreshRooms, emitTyping, getDmId,
+    }}>
+      {children}
+    </ChatContext.Provider>
+  )
+}
+
+export function useChat() { return useContext(ChatContext) }

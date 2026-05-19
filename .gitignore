@@ -1,0 +1,18 @@
+# 환경 변수
+.env.local
+.env.*.local
+
+# 의존성
+node_modules/
+
+# Next.js 빌드
+.next/
+out/
+
+# 로그
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
